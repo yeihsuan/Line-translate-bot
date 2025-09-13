@@ -1,4 +1,4 @@
-// server.js  (LINE Bot × LibreTranslate × /tran × 雙向翻譯 × Pivot備援)
+// server.js  (LINE Bot × LibreTranslate + MyMemory 級聯 × /tran × 雙向翻譯)
 const express = require('express');
 const line = require('@line/bot-sdk');
 const axios = require('axios');
@@ -13,19 +13,25 @@ const lineConfig = {
 };
 const client = new line.Client(lineConfig);
 
-/** ========= LibreTranslate 設定 ========= **/
+/** ========= LibreTranslate 設定（可加更多節點） ========= **/
 const LT_BASES = [
   process.env.LT_ENDPOINT || 'https://libretranslate.de',
-  // 你也可以加更多公共節點作為備援，例如：
   // 'https://translate.astian.org',
-  // 'https://libretranslate.com'
+  // 'https://libretranslate.com',
 ];
-
-function ltUrl(base, path) { return `${base}${path}`; }
 const SUPPORTED = ['zh', 'en', 'ja', 'th', 'ko', 'vi', 'fr', 'de', 'es'];
+const lt = (base, path) => `${base}${path}`;
 
-// 以 userId 暫存語言配對（正式可改 Redis/DB）
-const userPairs = new Map();
+/** ========= MyMemory（免費備援） ========= **/
+async function myMemoryTranslate(text, source, target) {
+  // MyMemory 支援 source=auto
+  const src = source === 'auto' ? 'auto' : source;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(src)}|${encodeURIComponent(target)}`;
+  const resp = await axios.get(url, { timeout: 15000 });
+  // 主要結果在 responseData.translatedText
+  const out = resp?.data?.responseData?.translatedText || '';
+  return out;
+}
 
 /** ========= 小工具：分段與安全回覆 ========= **/
 function chunkText(str, size = 900) {
@@ -34,11 +40,16 @@ function chunkText(str, size = 900) {
   while (i < str.length) { out.push(str.slice(i, i + size)); i += size; }
   return out.length ? out : [''];
 }
-
 async function replyText(client, replyToken, text) {
   const chunks = chunkText(text);
-  const messages = chunks.map((t) => ({ type: 'text', text: t || ' ' }));
+  const messages = chunks.map(t => ({ type: 'text', text: t || ' ' }));
   return client.replyMessage(replyToken, messages);
+}
+function sameMeaning(a, b) {
+  if (!a || !b) return false;
+  const na = a.trim().replace(/\s+/g, ' ');
+  const nb = b.trim().replace(/\s+/g, ' ');
+  return na === nb;
 }
 
 /** ========= Quick Reply（20字以內） ========= **/
@@ -59,56 +70,86 @@ function langQuickReply() {
   };
 }
 
-/** ========= 語言偵測 & 翻譯 ========= **/
+/** ========= 語言偵測（LibreTranslate 節點輪詢） ========= **/
 async function detectLang(text) {
   for (const base of LT_BASES) {
     try {
       const resp = await axios.post(
-        ltUrl(base, '/detect'),
+        lt(base, '/detect'),
         { q: text },
         { headers: { 'Content-Type': 'application/json' }, timeout: 12000 }
       );
       const list = resp.data;
       return Array.isArray(list) && list.length ? list[0].language : 'auto';
-    } catch (_e) { /* 換下一個節點 */ }
+    } catch (_) { /* 換下一個節點 */ }
   }
   return 'auto';
 }
 
-async function translateOnce(base, text, source, target) {
+/** ========= 供應商 1：LibreTranslate ========= **/
+async function ltTranslateOnce(base, text, source, target) {
   const resp = await axios.post(
-    ltUrl(base, '/translate'),
+    lt(base, '/translate'),
     { q: text, source, target, format: 'text' },
     { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
   );
   return resp.data?.translatedText || '';
 }
-
-/** 智慧翻譯：先直翻；失敗或結果＝原文時，走英文跳板 src→en→target */
-async function smartTranslate(text, src, target) {
-  // 先用 src 做為 source；若不支援就用 'auto'
+async function ltTranslateSmart(text, src, target) {
   const source = SUPPORTED.includes(src) ? src : 'auto';
-
-  // 逐個節點嘗試
   for (const base of LT_BASES) {
     try {
       // 直翻
-      let out = await translateOnce(base, text, source, target);
-      if (out && out.trim() && out.trim() !== text.trim()) return out;
+      let out = await ltTranslateOnce(base, text, source, target);
+      if (out && out.trim() && !sameMeaning(out, text)) return out;
 
-      // 若直翻失敗或等於原文，且語言不同 → 英文跳板
+      // 英文跳板
       if (src !== target) {
-        const mid = await translateOnce(base, text, source, 'en');
-        if (mid && mid.trim() && mid.trim() !== text.trim()) {
-          const out2 = await translateOnce(base, mid, 'en', target);
-          if (out2 && out2.trim()) return out2;
+        const mid = await ltTranslateOnce(base, text, source, 'en');
+        if (mid && mid.trim() && !sameMeaning(mid, text)) {
+          const out2 = await ltTranslateOnce(base, mid, 'en', target);
+          if (out2 && out2.trim() && !sameMeaning(out2, text)) return out2;
         }
       }
-    } catch (_e) {
-      // 換下一個節點
-    }
+    } catch (_) { /* 換下一個節點 */ }
   }
-  // 全部節點與策略都失敗 → 回空字串讓上層用原文保底
+  return ''; // 讓上層試 MyMemory
+}
+
+/** ========= 供應商 2：MyMemory（備援） ========= **/
+async function mmTranslateSmart(text, src, target) {
+  const source = SUPPORTED.includes(src) ? src : 'auto';
+
+  // 直翻
+  try {
+    const out = await myMemoryTranslate(text, source, target);
+    if (out && out.trim() && !sameMeaning(out, text)) return out;
+  } catch (_) {}
+
+  // 英文跳板
+  if (src !== target) {
+    try {
+      const mid = await myMemoryTranslate(text, source, 'en');
+      if (mid && mid.trim() && !sameMeaning(mid, text)) {
+        const out2 = await myMemoryTranslate(mid, 'en', target);
+        if (out2 && out2.trim() && !sameMeaning(out2, text)) return out2;
+      }
+    } catch (_) {}
+  }
+  return '';
+}
+
+/** ========= 高層封裝：多供應商級聯 ========= **/
+async function smartTranslate(text, src, target) {
+  // 1) 先 LibreTranslate
+  let out = await ltTranslateSmart(text, src, target);
+  if (out && out.trim() && !sameMeaning(out, text)) return out;
+
+  // 2) 再 MyMemory
+  out = await mmTranslateSmart(text, src, target);
+  if (out && out.trim() && !sameMeaning(out, text)) return out;
+
+  // 全失敗 → 空字串（讓上層做保底）
   return '';
 }
 
@@ -124,6 +165,9 @@ const HELP = [
   '   /my  查看目前語言配對  / show current pair',
   '   /help  顯示說明  / show help',
 ].join('\n');
+
+/** ========= 暫存配對 ========= **/
+const userPairs = new Map(); // userId -> { mine, friend }
 
 /** ========= Webhook ========= **/
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
@@ -162,7 +206,7 @@ async function handleEvent(event) {
     });
   }
 
-  // /tran 指令：/tran zh en
+  // /tran 指令
   const m = text.match(/^\/tran\s+(\w+)\s+(\w+)$/i);
   if (m) {
     const mine = m[1].toLowerCase();
@@ -182,8 +226,7 @@ async function handleEvent(event) {
       type: 'text',
       text:
         `已設定語言配對：你/You=${mine}，朋友/Friend=${friend}\n` +
-        `Translation pair set: you=${mine}, friend=${friend}\n` +
-        `開始聊天吧！Start chatting!`,
+        `Translation pair set: you=${mine}, friend=${friend}\n開始聊天吧！Start chatting!`,
     });
   }
 
@@ -206,14 +249,13 @@ async function handleEvent(event) {
     let target;
     if (src === pair.mine) target = pair.friend;
     else if (src === pair.friend) target = pair.mine;
-    else target = pair.friend; // 偵測不明時，預設翻給朋友
+    else target = pair.friend;
 
-    // 語言相同直接回原文
     if (src === target) return replyText(client, event.replyToken, text);
 
     const out = await smartTranslate(text, src, target);
 
-    // 保底：翻譯結果為空 → 回原文（避免 400: messages[0].text may not be empty）
+    // 保底：翻譯結果為空 → 回原文，避免 400 空訊息
     let finalText = (out && out.trim()) ? out : text;
     if (!finalText || !finalText.trim()) {
       finalText = '（翻譯結果為空 / Empty translation）';
