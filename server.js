@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const line = require('@line/bot-sdk');
 const axios = require('axios');
@@ -10,8 +9,13 @@ const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-
 const client = new line.Client(lineConfig);
+
+// LibreTranslate 端點（可自訂環境變數，否則用公開免費的）
+const LT_ENDPOINT = process.env.LT_ENDPOINT || 'https://libretranslate.de/translate';
+
+// 簡單的語言代碼對照（輸入 /en /ja /th /ko /vi /zh）
+const LANG_MAP = new Set(['en', 'ja', 'th', 'ko', 'vi', 'zh', 'fr', 'de', 'es']);
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   const events = req.body.events;
@@ -22,39 +26,47 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
-  const prompt = `請將下列句子翻譯為繁體中文：\n\n${event.message.text}`;
+  const raw = event.message.text.trim();
+  // 指令：/en 早安  →  翻成英文
+  let target = 'zh'; // 預設翻譯成繁中
+  let text = raw;
+
+  const m = raw.match(/^\/(\w+)\s+([\s\S]+)/);
+  if (m) {
+    const code = m[1].toLowerCase();
+    if (LANG_MAP.has(code)) {
+      target = code;
+      text = m[2];
+    }
+  }
 
   try {
-    const response = await axios.post(
-      'https://api.deepseek.com/v1/chat/completions',
+    const resp = await axios.post(
+      LT_ENDPOINT,
       {
-        model: 'deepseek-chat',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
+        q: text,
+        source: 'auto',     // 自動偵測
+        target,             // 目標語言
+        format: 'text'
       },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
+      { headers: { 'Content-Type': 'application/json' } }
     );
 
-    const translatedText = response.data.choices?.[0]?.message?.content || '⚠️ 翻譯失敗';
+    const translated = resp.data?.translatedText || '翻譯失敗，稍後再試。';
 
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: translatedText,
+      text: translated
     });
-  } catch (error) {
-    console.error('DeepSeek API error:', error);
+  } catch (err) {
+    console.error('LibreTranslate error:', err?.response?.data || err.message);
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: '⚠️ 系統錯誤，請稍後再試',
+      text: '⚠️ 翻譯服務暫時無法使用，請稍後再試。'
     });
   }
 }
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Bot is running on port 3000');
+  console.log('Bot running on port ' + (process.env.PORT || 3000));
 });
