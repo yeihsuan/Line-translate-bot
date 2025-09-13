@@ -1,4 +1,4 @@
-// server.js  (LibreTranslate + 雙向翻譯 + /tran 指令 + 中英雙語系統訊息)
+// server.js  (LINE Bot × LibreTranslate × /tran × 雙向翻譯 × 防呆/分段回覆)
 const express = require('express');
 const line = require('@line/bot-sdk');
 const axios = require('axios');
@@ -6,25 +6,43 @@ require('dotenv').config();
 
 const app = express();
 
-// LINE config
+/** ========= LINE 基本設定 ========= **/
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const client = new line.Client(lineConfig);
 
-// LibreTranslate endpoint
-const LT_BASE = process.env.LT_ENDPOINT || 'https://libretranslate.de';
+/** ========= LibreTranslate 設定 ========= **/
+const LT_BASE = process.env.LT_ENDPOINT || 'https://libretranslate.de'; // 可換成自架節點
 const DETECT_URL = `${LT_BASE}/detect`;
 const TRANSLATE_URL = `${LT_BASE}/translate`;
 
-// 支援語言
+// 支援語言（可自行擴充）
 const SUPPORTED = ['zh', 'en', 'ja', 'th', 'ko', 'vi', 'fr', 'de', 'es'];
 
-// 以 userId 暫存語言配對（若要長期保存，建議換 DB/Redis）
+// 以 userId 暫存語言配對（正式可改 Redis/DB 持久化）
 const userPairs = new Map(); // userId -> { mine:'zh', friend:'en' }
 
-// Quick Reply 選單（按了會直接送出 /tran 指令）
+/** ========= 小工具：分段與安全回覆 ========= **/
+function chunkText(str, size = 900) {
+  // LINE 單則訊息上限 ~2000字，保守切 900，避免多語多位元造成截斷
+  const out = [];
+  let i = 0;
+  while (i < str.length) {
+    out.push(str.slice(i, i + size));
+    i += size;
+  }
+  return out.length ? out : [''];
+}
+
+async function replyText(client, replyToken, text) {
+  const chunks = chunkText(text);
+  const messages = chunks.map((t) => ({ type: 'text', text: t || ' ' })); // 避免空字串
+  return client.replyMessage(replyToken, messages);
+}
+
+/** ========= Quick Reply（20字以內） ========= **/
 function langQuickReply() {
   const presets = [
     ['中↔英', 'zh', 'en'],
@@ -42,7 +60,7 @@ function langQuickReply() {
   };
 }
 
-// 偵測語言
+/** ========= 語言偵測與翻譯 ========= **/
 async function detectLang(text) {
   const resp = await axios.post(
     DETECT_URL,
@@ -53,7 +71,6 @@ async function detectLang(text) {
   return Array.isArray(list) && list.length ? list[0].language : 'auto';
 }
 
-// 翻譯
 async function translate(text, source, target) {
   const resp = await axios.post(
     TRANSLATE_URL,
@@ -63,7 +80,7 @@ async function translate(text, source, target) {
   return resp.data?.translatedText || '';
 }
 
-// 幫助訊息（雙語）
+/** ========= 說明訊息（中英雙語） ========= **/
 const HELP = [
   '🧭 使用方式 / How to use:',
   '1) 先設定語言配對：/tran <我的語言> <朋友的語言>',
@@ -76,6 +93,7 @@ const HELP = [
   '   /help  顯示說明  / show help',
 ].join('\n');
 
+/** ========= Webhook ========= **/
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   const events = req.body.events || [];
   const results = await Promise.all(events.map(handleEvent));
@@ -86,7 +104,7 @@ async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const userId = event.source.userId;
-  const text = event.message.text.trim();
+  const text = (event.message.text || '').trim();
 
   // /help
   if (text === '/help') {
@@ -121,7 +139,8 @@ async function handleEvent(event) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text:
-          '不支援的語言代碼。支援 / Supported: ' + SUPPORTED.join(', ') +
+          '不支援的語言代碼。支援 / Supported: ' +
+          SUPPORTED.join(', ') +
           '\n例如 / Example: /tran zh en',
         quickReply: langQuickReply(),
       });
@@ -151,28 +170,38 @@ async function handleEvent(event) {
 
   // 雙向翻譯
   try {
-    const src = await detectLang(text); // 偵測是誰的語言
+    const src = await detectLang(text);
     let target;
     if (src === pair.mine) target = pair.friend;
     else if (src === pair.friend) target = pair.mine;
-    else target = pair.friend; // 無法判斷時預設翻給朋友
+    else target = pair.friend; // 偵測不明時，預設翻給朋友
+
+    // 若語言相同則直接回原文，避免無意義翻譯
+    if (src === target) return replyText(client, event.replyToken, text);
 
     const out = await translate(text, 'auto', target);
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: out,
-    });
+
+    // 保底：翻譯結果為空 → 回原文（避免 400: messages[0].text may not be empty）
+    let finalText = (out && out.trim()) ? out : text;
+    if (!finalText || !finalText.trim()) {
+      finalText = '（翻譯結果為空 / Empty translation）';
+    }
+
+    return replyText(client, event.replyToken, finalText);
   } catch (e) {
     console.error('translate error:', e?.response?.data || e.message);
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text:
-        '⚠️ 翻譯暫時無法使用，稍後再試。\n' +
-        'Translation service temporarily unavailable. Please try again later.',
-    });
+    return replyText(
+      client,
+      event.replyToken,
+      '⚠️ 翻譯服務暫時無法使用，已回覆原文。\n' +
+        'Translation service temporarily unavailable. Original text below:\n' +
+        text
+    );
   }
 }
 
+/** ========= 健康檢查與啟動 ========= **/
+app.get('/', (_, res) => res.send('LINE translator bot is running.'));
 app.listen(process.env.PORT || 3000, () => {
   console.log('Bot running on port ' + (process.env.PORT || 3000));
 });
