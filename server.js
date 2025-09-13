@@ -1,4 +1,4 @@
-// server.js  (LINE Bot × LibreTranslate × /tran × 雙向翻譯 × 防呆/分段回覆)
+// server.js  (LINE Bot × LibreTranslate × /tran × 雙向翻譯 × Pivot備援)
 const express = require('express');
 const line = require('@line/bot-sdk');
 const axios = require('axios');
@@ -14,31 +14,30 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 
 /** ========= LibreTranslate 設定 ========= **/
-const LT_BASE = process.env.LT_ENDPOINT || 'https://libretranslate.de'; // 可換成自架節點
-const DETECT_URL = `${LT_BASE}/detect`;
-const TRANSLATE_URL = `${LT_BASE}/translate`;
+const LT_BASES = [
+  process.env.LT_ENDPOINT || 'https://libretranslate.de',
+  // 你也可以加更多公共節點作為備援，例如：
+  // 'https://translate.astian.org',
+  // 'https://libretranslate.com'
+];
 
-// 支援語言（可自行擴充）
+function ltUrl(base, path) { return `${base}${path}`; }
 const SUPPORTED = ['zh', 'en', 'ja', 'th', 'ko', 'vi', 'fr', 'de', 'es'];
 
-// 以 userId 暫存語言配對（正式可改 Redis/DB 持久化）
-const userPairs = new Map(); // userId -> { mine:'zh', friend:'en' }
+// 以 userId 暫存語言配對（正式可改 Redis/DB）
+const userPairs = new Map();
 
 /** ========= 小工具：分段與安全回覆 ========= **/
 function chunkText(str, size = 900) {
-  // LINE 單則訊息上限 ~2000字，保守切 900，避免多語多位元造成截斷
   const out = [];
   let i = 0;
-  while (i < str.length) {
-    out.push(str.slice(i, i + size));
-    i += size;
-  }
+  while (i < str.length) { out.push(str.slice(i, i + size)); i += size; }
   return out.length ? out : [''];
 }
 
 async function replyText(client, replyToken, text) {
   const chunks = chunkText(text);
-  const messages = chunks.map((t) => ({ type: 'text', text: t || ' ' })); // 避免空字串
+  const messages = chunks.map((t) => ({ type: 'text', text: t || ' ' }));
   return client.replyMessage(replyToken, messages);
 }
 
@@ -60,24 +59,57 @@ function langQuickReply() {
   };
 }
 
-/** ========= 語言偵測與翻譯 ========= **/
+/** ========= 語言偵測 & 翻譯 ========= **/
 async function detectLang(text) {
-  const resp = await axios.post(
-    DETECT_URL,
-    { q: text },
-    { headers: { 'Content-Type': 'application/json' } }
-  );
-  const list = resp.data;
-  return Array.isArray(list) && list.length ? list[0].language : 'auto';
+  for (const base of LT_BASES) {
+    try {
+      const resp = await axios.post(
+        ltUrl(base, '/detect'),
+        { q: text },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 12000 }
+      );
+      const list = resp.data;
+      return Array.isArray(list) && list.length ? list[0].language : 'auto';
+    } catch (_e) { /* 換下一個節點 */ }
+  }
+  return 'auto';
 }
 
-async function translate(text, source, target) {
+async function translateOnce(base, text, source, target) {
   const resp = await axios.post(
-    TRANSLATE_URL,
+    ltUrl(base, '/translate'),
     { q: text, source, target, format: 'text' },
-    { headers: { 'Content-Type': 'application/json' } }
+    { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
   );
   return resp.data?.translatedText || '';
+}
+
+/** 智慧翻譯：先直翻；失敗或結果＝原文時，走英文跳板 src→en→target */
+async function smartTranslate(text, src, target) {
+  // 先用 src 做為 source；若不支援就用 'auto'
+  const source = SUPPORTED.includes(src) ? src : 'auto';
+
+  // 逐個節點嘗試
+  for (const base of LT_BASES) {
+    try {
+      // 直翻
+      let out = await translateOnce(base, text, source, target);
+      if (out && out.trim() && out.trim() !== text.trim()) return out;
+
+      // 若直翻失敗或等於原文，且語言不同 → 英文跳板
+      if (src !== target) {
+        const mid = await translateOnce(base, text, source, 'en');
+        if (mid && mid.trim() && mid.trim() !== text.trim()) {
+          const out2 = await translateOnce(base, mid, 'en', target);
+          if (out2 && out2.trim()) return out2;
+        }
+      }
+    } catch (_e) {
+      // 換下一個節點
+    }
+  }
+  // 全部節點與策略都失敗 → 回空字串讓上層用原文保底
+  return '';
 }
 
 /** ========= 說明訊息（中英雙語） ========= **/
@@ -176,10 +208,10 @@ async function handleEvent(event) {
     else if (src === pair.friend) target = pair.mine;
     else target = pair.friend; // 偵測不明時，預設翻給朋友
 
-    // 若語言相同則直接回原文，避免無意義翻譯
+    // 語言相同直接回原文
     if (src === target) return replyText(client, event.replyToken, text);
 
-    const out = await translate(text, 'auto', target);
+    const out = await smartTranslate(text, src, target);
 
     // 保底：翻譯結果為空 → 回原文（避免 400: messages[0].text may not be empty）
     let finalText = (out && out.trim()) ? out : text;
