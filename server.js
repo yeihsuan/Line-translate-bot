@@ -27,12 +27,12 @@ const userPairs = new Map(); // userId -> { mine:'zh', friend:'en' }
 // Quick Reply 選單（按了會直接送出 /tran 指令）
 function langQuickReply() {
   const presets = [
-    ['中文↔英文 Chinese↔English', 'zh', 'en'],
-    ['中文↔日文 Chinese↔Japanese', 'zh', 'ja'],
-    ['中文↔泰文 Chinese↔Thai', 'zh', 'th'],
-    ['中文↔韓文 Chinese↔Korean', 'zh', 'ko'],
-    ['中文↔越南 Chinese↔Vietnamese', 'zh', 'vi'],
-    ['英文↔日文 English↔Japanese', 'en', 'ja'],
+    ['中↔英', 'zh', 'en'],
+    ['中↔日', 'zh', 'ja'],
+    ['中↔泰', 'zh', 'th'],
+    ['中↔韓', 'zh', 'ko'],
+    ['中↔越', 'zh', 'vi'],
+    ['英↔日', 'en', 'ja'],
   ];
   return {
     items: presets.map(([label, a, b]) => ({
